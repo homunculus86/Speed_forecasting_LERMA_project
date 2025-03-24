@@ -6,7 +6,6 @@ import statsmodels.api as sm
 from statsmodels.tsa.arima.model import ARIMA
 from pmdarima import auto_arima
 from sklearn.metrics import mean_squared_error, mean_absolute_error
-import seaborn as sns
 import matplotlib.pyplot as plt
 
 df = pd.read_csv("T1_06_30_2021_2 (1).csv")
@@ -67,13 +66,7 @@ def auto_select_arima(series, p_range=(0, 5), d_range=(0, 2), q_range=(0, 5)):
 def test_arima(
     df, target_col="Speed", interval=200, p_range=(0, 5), d_range=(0, 2), q_range=(0, 5)
 ):
-    """
-    Runs ARIMA on rolling intervals ensuring stationarity.
-    Uses AutoARIMA to select the best (p, d, q) values.
-    Evaluates forecasts using RMSE, MAE, MAPE, and SMAPE.
-    Tracks execution time for model fitting and forecasting.
-    """
-    forecast_horizon = 10  # Explicitly set forecast horizon to 10
+    forecast_horizon = 10
     total_start_time = time.time()
 
     if "datetime" not in df.columns:
@@ -83,78 +76,108 @@ def test_arima(
     df = df.dropna(subset=["datetime"]).sort_values(by="datetime").set_index("datetime")
 
     detected_freq = pd.infer_freq(df.index) or "s"
-    series = df[target_col].astype(float)
+    full_series = df[target_col].astype(float)
     forecasts = []
-
-    # Measure time complexity for 1-step ahead prediction
     single_step_times = []
 
-    for start in range(0, len(series) - interval, forecast_horizon):
+    p, d, q = None, None, None
+    model = None
+    fitted_model = None
+
+    start = 0
+    while start + interval + forecast_horizon < len(full_series):
         end = start + interval
-        if end + forecast_horizon >= len(series):
-            break
+        train_data = full_series.iloc[start:end]
+        test_data = full_series.iloc[end : end + forecast_horizon]
 
-        train_data, test_data = (
-            series.iloc[start:end],
-            series.iloc[end : end + forecast_horizon],
-        )
-
-        try:
-            # Select best ARIMA order using AutoARIMA
+        if fitted_model is None:
             p, d, q = auto_select_arima(train_data, p_range, d_range, q_range)
-
-            # Fit the best ARIMA model
-            model_fit_start = time.time()
             model = ARIMA(train_data, order=(p, d, q))
             fitted_model = model.fit()
-            model_fit_end = time.time()
 
-            # Forecast for the defined horizon
-            forecast_start = time.time()
-            forecast = fitted_model.forecast(steps=forecast_horizon)
-            forecast_end = time.time()
+        forecast_start = time.time()
+        forecast = fitted_model.forecast(steps=forecast_horizon)
+        forecast_end = time.time()
 
-            # Measure time complexity for a single-step prediction
-            single_step_start = time.time()
-            _ = fitted_model.forecast(steps=1)
-            single_step_end = time.time()
-            single_step_times.append(single_step_end - single_step_start)
+        t1 = time.time()
+        _ = fitted_model.forecast(steps=1)
+        t2 = time.time()
+        single_step_times.append(t2 - t1)
 
-            # Store forecast results
-            forecast_index = pd.date_range(
-                start=series.index[end], periods=forecast_horizon, freq=detected_freq
-            )
-            forecast_series = pd.Series(forecast.values, index=forecast_index)
+        forecast_index = pd.date_range(
+            start=full_series.index[end], periods=forecast_horizon, freq=detected_freq
+        )
+        forecast_series = pd.Series(forecast.values, index=forecast_index)
+        errors = evaluate_forecast(test_data.values, forecast_series.values)
+        smape = errors["SMAPE"]
 
-            # Compute error metrics
-            errors = evaluate_forecast(test_data.values, forecast_series.values)
+        print(f"Interval {start}-{end}: Best ARIMA({p},{d},{q}) Forecast")
+        print(f"SMAPE: {smape:.2f}%")
 
-            forecasts.append((start, forecast_series, errors))
+        forecasts.append((start, forecast_series, errors))
 
+        # --- ⬇️ PLOT HERE
+        plt.figure(figsize=(15, 5))
+        plt.plot(
+            full_series.index[start:end],
+            full_series.iloc[start:end],
+            label="Training Data",
+            color="blue",
+        )
+        plt.plot(
+            test_data.index,
+            test_data.values,
+            label="Actual (Next 10)",
+            color="green",
+            marker="o",
+        )
+        plt.plot(
+            forecast_series.index,
+            forecast_series.values,
+            label="Forecast (Next 10)",
+            color="red",
+            linestyle="dashed",
+            marker="x",
+        )
+        plt.title(f"Prediction at Interval {start}-{end}")
+        plt.xlabel("Time")
+        plt.ylabel("Speed")
+        plt.legend()
+        plt.grid(True)
+        plt.xticks(rotation=45)
+        plt.tight_layout()
+        plt.show()
+
+        time.sleep(1)
+
+        # Decide whether to retrain or not
+        if smape > 15:
             print(
-                f"Interval {start}-{end}: Best ARIMA({p},{d},{q}) Forecast -> {forecast_series.values}"
+                " SMAPE > 15% — Retraining model with all data up to this point and using actual values"
             )
-            print(
-                f"Evaluation -> RMSE: {errors['RMSE']:.4f}, MAE: {errors['MAE']:.4f}, MAPE: {errors['MAPE']:.2f}%, SMAPE: {errors['SMAPE']:.2f}%"
+            start += forecast_horizon
+            p, d, q = auto_select_arima(
+                full_series.iloc[: start + interval], p_range, d_range, q_range
             )
-            print(
-                f"Model Fit Time: {model_fit_end - model_fit_start:.4f} sec | Forecast Time: {forecast_end - forecast_start:.4f} sec\n"
-            )
+            model = ARIMA(full_series.iloc[: start + interval], order=(p, d, q))
+            fitted_model = model.fit()
 
-        except Exception as e:
-            print(f"ARIMA model failed at interval {start}-{end} due to: {str(e)}")
-            continue
+        else:
+            print(" SMAPE ≤ 15% — Reusing model and using forecasted values")
+            new_values = pd.Series(forecast.values, index=forecast_index)
+            full_series = pd.concat([full_series, new_values])
+            start += forecast_horizon
+
+        print(f"Model Fit Time: {forecast_end - forecast_start:.4f} sec\n")
 
     total_end_time = time.time()
-    avg_single_step_time = np.mean(single_step_times) if single_step_times else None
+    avg_step_time = np.mean(single_step_times) if single_step_times else None
 
+    print(f"\nTotal execution time: {total_end_time - total_start_time:.2f} sec")
     print(
-        f"Total execution time for test_arima: {total_end_time - total_start_time:.4f} sec"
-    )
-    print(
-        f"Average time complexity for 1-step ahead forecast: {avg_single_step_time:.6f} sec"
-        if avg_single_step_time
-        else "No 1-step forecast timings recorded"
+        f"Average 1-step forecast time: {avg_step_time:.6f} sec"
+        if avg_step_time
+        else "No 1-step forecast time recorded"
     )
 
     return forecasts
